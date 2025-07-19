@@ -27,14 +27,55 @@ class Colors:
 log_queue = queue.Queue()
 running = True
 
-def get_process_name(pid):
-    """Get process name from PID"""
+def get_process_info(pid):
+    """Get process name and path from PID"""
     try:
-        result = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], 
-                              capture_output=True, text=True)
-        return result.stdout.strip()
+        # Get process name
+        name_result = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], 
+                                   capture_output=True, text=True)
+        name = name_result.stdout.strip()
+        
+        # Get full path
+        path_result = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], 
+                                   capture_output=True, text=True)
+        full_path = path_result.stdout.strip()
+        
+        return name, full_path
     except:
-        return f"Unknown (PID: {pid})"
+        return f"Unknown (PID: {pid})", ""
+
+def is_system_process(path):
+    """Check if process is a system/background process"""
+    system_indicators = [
+        '/System/Library/',
+        'WebKit.GPU',
+        'WebKit.WebContent',
+        'com.apple.WebKit',
+        'coreaudiod',
+        'audiomxd'
+    ]
+    return any(indicator in path for indicator in system_indicators)
+
+def get_user_friendly_name(name, path):
+    """Get user-friendly app name"""
+    # Map common processes to friendly names
+    app_map = {
+        'Google Chrome': 'Google Chrome',
+        'firefox': 'Firefox',
+        'Safari': 'Safari',
+        'zoom.us': 'Zoom',
+        'Slack': 'Slack',
+        'Discord': 'Discord',
+        'Skype': 'Skype',
+        'Microsoft Teams': 'Microsoft Teams',
+        'FaceTime': 'FaceTime'
+    }
+    
+    for app, friendly_name in app_map.items():
+        if app.lower() in name.lower() or app.lower() in path.lower():
+            return friendly_name
+    
+    return name
 
 def monitor_system_logs():
     """Monitor system logs for microphone access"""
@@ -55,7 +96,13 @@ def monitor_system_logs():
         match = pid_pattern.search(line)
         if match and ('microphone' in line.lower() or 'audio' in line.lower()):
             pid = int(match.group(1))
-            app_name = get_process_name(pid)
+            name, path = get_process_info(pid)
+            
+            # Skip system processes
+            if is_system_process(path):
+                continue
+                
+            app_name = get_user_friendly_name(name, path)
             timestamp = datetime.now().strftime('%H:%M:%S')
             
             log_queue.put({
@@ -81,12 +128,17 @@ def monitor_audio_devices():
                 parts = line.split()
                 if len(parts) > 1:
                     pid = int(parts[1])
-                    current_pids.add(pid)
+                    name, path = get_process_info(pid)
+                    
+                    # Skip system processes
+                    if not is_system_process(path):
+                        current_pids.add(pid)
             
             # Check for new processes
             new_pids = current_pids - last_active_pids
             for pid in new_pids:
-                app_name = get_process_name(pid)
+                name, path = get_process_info(pid)
+                app_name = get_user_friendly_name(name, path)
                 timestamp = datetime.now().strftime('%H:%M:%S')
                 log_queue.put({
                     'timestamp': timestamp,
@@ -98,7 +150,8 @@ def monitor_audio_devices():
             # Check for stopped processes
             stopped_pids = last_active_pids - current_pids
             for pid in stopped_pids:
-                app_name = get_process_name(pid)
+                name, path = get_process_info(pid)
+                app_name = get_user_friendly_name(name, path)
                 timestamp = datetime.now().strftime('%H:%M:%S')
                 log_queue.put({
                     'timestamp': timestamp,
