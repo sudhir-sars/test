@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Simple Microphone Monitor - Logs apps accessing microphone on macOS
-Monitors microphone access and identifies parent applications
+Follows OverSight's approach: monitors audio device state + system logs
 """
 
 import subprocess
@@ -26,186 +26,188 @@ class Colors:
 # Global queue for log messages
 log_queue = queue.Queue()
 running = True
-active_apps = {}  # Track active apps
 
-def get_parent_app(pid):
-    """Find the parent application for a process"""
+def get_process_info(pid):
+    """Get process name and path from PID"""
     try:
-        # Get parent process ID
-        ppid_result = subprocess.run(['ps', '-p', str(pid), '-o', 'ppid='], 
+        # Get process name
+        name_result = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], 
                                    capture_output=True, text=True)
-        ppid = ppid_result.stdout.strip()
+        name = name_result.stdout.strip()
         
-        if ppid:
-            # Get parent process info
-            parent_result = subprocess.run(['ps', '-p', ppid, '-o', 'comm='], 
-                                         capture_output=True, text=True)
-            parent_name = parent_result.stdout.strip()
-            
-            # Check if parent is a known browser
-            if 'Safari' in parent_name:
-                return 'Safari', ppid
-            elif 'Google Chrome' in parent_name:
-                return 'Google Chrome', ppid
-            elif 'firefox' in parent_name.lower():
-                return 'Firefox', ppid
+        # Get full path
+        path_result = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], 
+                                   capture_output=True, text=True)
+        full_path = path_result.stdout.strip()
+        
+        return name, full_path
     except:
-        pass
-    
-    return None, None
+        return f"Unknown (PID: {pid})", ""
 
-def get_app_name_for_process(pid, process_name):
-    """Determine the actual app name for a process"""
-    # Direct app detection
-    app_mapping = {
+def get_user_friendly_name(name, path):
+    """Get user-friendly app name"""
+    name_lower = name.lower()
+    path_lower = path.lower()
+    
+    # WebKit processes are Safari
+    if 'webkit' in name_lower:
+        return 'Safari'
+    
+    # Chrome and Chrome Helper
+    if 'google chrome' in name_lower or 'chrome' in path_lower:
+        return 'Google Chrome'
+    
+    # Other common apps
+    app_map = {
+        'firefox': 'Firefox',
         'zoom.us': 'Zoom',
-        'Slack': 'Slack',
-        'Discord': 'Discord',
-        'Skype': 'Skype',
+        'slack': 'Slack',
+        'discord': 'Discord',
+        'skype': 'Skype',
         'teams': 'Microsoft Teams',
         'facetime': 'FaceTime',
         'whatsapp': 'WhatsApp',
         'telegram': 'Telegram',
-        'signal': 'Signal'
+        'obs': 'OBS Studio',
+        'screenflow': 'ScreenFlow'
     }
     
-    process_lower = process_name.lower()
+    for key, friendly_name in app_map.items():
+        if key in name_lower or key in path_lower:
+            return friendly_name
     
-    # Check direct mappings
-    for key, app in app_mapping.items():
-        if key in process_lower:
-            return app
+    # Filter out system daemons
+    if name.endswith('d') and '/usr' in path:
+        return None
     
-    # Check if it's a WebKit process
-    if 'webkit' in process_lower:
-        parent_app, parent_pid = get_parent_app(pid)
-        if parent_app:
-            return parent_app
-        # If no parent found, it's likely Safari (WebKit is Safari's engine)
-        return 'Safari'
-    
-    # Check if it's Chrome
-    if 'chrome' in process_lower:
-        return 'Google Chrome'
-    
-    # Default to process name
-    return process_name
+    return name
 
-def monitor_microphone_access():
-    """Main monitoring function using log stream"""
-    print(f"\n{Colors.BOLD}🎙️  Microphone Monitor Started{Colors.RESET}")
-    print(f"{Colors.BLUE}Monitoring microphone access...{Colors.RESET}\n")
-    
-    # Monitor TCCd (Transparency, Consent, and Control daemon) logs for mic access
+def monitor_system_logs():
+    """Monitor system logs for microphone access"""
+    # Monitor CoreMedia logs
     log_cmd = ['log', 'stream', '--predicate', 
-               '(subsystem == "com.apple.TCC" OR subsystem == "com.apple.coremedia") AND ' +
-               '(eventMessage CONTAINS "microphone" OR eventMessage CONTAINS "audio input")']
+               'subsystem == "com.apple.coremedia" OR subsystem == "com.apple.cmio"']
     
-    try:
-        process = subprocess.Popen(log_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                  text=True, bufsize=1)
-        
-        # Also monitor audio device usage
-        Thread(target=monitor_audio_activity, daemon=True).start()
-        
-        for line in process.stdout:
-            if not running:
-                break
-                
-            # Process log entries for microphone access
-            if 'granted' in line.lower() or 'accessing' in line.lower():
-                # Extract PID if available
-                pid_match = re.search(r'pid[:\s]+(\d+)', line, re.IGNORECASE)
-                if pid_match:
-                    pid = int(pid_match.group(1))
-                    
-                    # Get process info
-                    result = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], 
-                                          capture_output=True, text=True)
-                    process_name = result.stdout.strip()
-                    
-                    if process_name:
-                        app_name = get_app_name_for_process(pid, process_name)
-                        timestamp = datetime.now().strftime('%H:%M:%S')
-                        
-                        print(f"{Colors.GREEN}[{timestamp}] ▶ {Colors.BOLD}{app_name}{Colors.RESET} "
-                              f"{Colors.GREEN}accessing microphone (PID: {pid}){Colors.RESET}")
-                        
-                        active_apps[pid] = app_name
-                        
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        print(f"{Colors.RED}Error in log monitoring: {e}{Colors.RESET}")
+    process = subprocess.Popen(log_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                              text=True, bufsize=1)
+    
+    pid_pattern = re.compile(r'PID\s*=\s*(\d+)')
+    seen_pids = set()
+    
+    for line in process.stdout:
+        if not running:
+            break
+            
+        # Look for PID patterns in logs
+        match = pid_pattern.search(line)
+        if match and ('microphone' in line.lower() or 'audio' in line.lower()):
+            pid = int(match.group(1))
+            
+            # Avoid duplicate logs
+            if pid in seen_pids:
+                continue
+            seen_pids.add(pid)
+            
+            name, path = get_process_info(pid)
+            app_name = get_user_friendly_name(name, path)
+            
+            if app_name:  # Only show if we have a valid app name
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                log_queue.put({
+                    'timestamp': timestamp,
+                    'pid': pid,
+                    'app': app_name,
+                    'type': 'access'
+                })
 
-def monitor_audio_activity():
-    """Monitor audio input activity"""
-    last_check = set()
+def monitor_audio_devices():
+    """Monitor audio device state changes"""
+    last_active_pids = set()
     
     while running:
         try:
-            # Check for audio input activity
-            result = subprocess.run(['pmset', '-g', 'assertions'], 
+            # Get list of processes using audio
+            result = subprocess.run(['lsof', '-n', '/dev/audio*'], 
                                   capture_output=True, text=True)
             
-            # Also check CoreAudio for active input
-            audio_result = subprocess.run(['system_profiler', 'SPAudioDataType'], 
-                                        capture_output=True, text=True)
-            
-            # Look for processes using audio
-            lsof_result = subprocess.run(['lsof', '+D', '/dev'], 
-                                       capture_output=True, text=True)
-            
             current_pids = set()
-            
-            for line in lsof_result.stdout.splitlines():
-                if 'audio' in line.lower():
-                    parts = line.split()
-                    if len(parts) > 1:
-                        try:
-                            pid = int(parts[1])
-                            current_pids.add(pid)
-                        except:
-                            pass
+            for line in result.stdout.splitlines()[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) > 1:
+                    pid = int(parts[1])
+                    name, path = get_process_info(pid)
+                    app_name = get_user_friendly_name(name, path)
+                    
+                    if app_name:  # Only track if we have a valid app name
+                        current_pids.add(pid)
             
             # Check for new processes
-            new_pids = current_pids - last_check
+            new_pids = current_pids - last_active_pids
             for pid in new_pids:
-                if pid not in active_apps:
-                    try:
-                        result = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], 
-                                              capture_output=True, text=True)
-                        process_name = result.stdout.strip()
-                        
-                        if process_name:
-                            app_name = get_app_name_for_process(pid, process_name)
-                            timestamp = datetime.now().strftime('%H:%M:%S')
-                            
-                            print(f"{Colors.GREEN}[{timestamp}] ▶ {Colors.BOLD}{app_name}{Colors.RESET} "
-                                  f"{Colors.GREEN}started using microphone (PID: {pid}){Colors.RESET}")
-                            
-                            active_apps[pid] = app_name
-                    except:
-                        pass
+                name, path = get_process_info(pid)
+                app_name = get_user_friendly_name(name, path)
+                if app_name:
+                    timestamp = datetime.now().strftime('%H:%M:%S')
+                    log_queue.put({
+                        'timestamp': timestamp,
+                        'pid': pid,
+                        'app': app_name,
+                        'type': 'started'
+                    })
             
             # Check for stopped processes
-            stopped_pids = last_check - current_pids
+            stopped_pids = last_active_pids - current_pids
             for pid in stopped_pids:
-                if pid in active_apps:
-                    app_name = active_apps[pid]
+                name, path = get_process_info(pid)
+                app_name = get_user_friendly_name(name, path)
+                if app_name:
                     timestamp = datetime.now().strftime('%H:%M:%S')
-                    
-                    print(f"{Colors.RED}[{timestamp}] ■ {Colors.BOLD}{app_name}{Colors.RESET} "
-                          f"{Colors.RED}stopped using microphone (PID: {pid}){Colors.RESET}")
-                    
-                    del active_apps[pid]
+                    log_queue.put({
+                        'timestamp': timestamp,
+                        'pid': pid,
+                        'app': app_name,
+                        'type': 'stopped'
+                    })
             
-            last_check = current_pids
+            last_active_pids = current_pids
             
-        except Exception:
+        except Exception as e:
             pass
         
-        time.sleep(2)
+        time.sleep(1)  # Poll every second
+
+def display_logs():
+    """Display colored log messages"""
+    print(f"\n{Colors.BOLD}🎙️  Microphone Monitor Started{Colors.RESET}")
+    print(f"{Colors.BLUE}Monitoring microphone access...{Colors.RESET}\n")
+    
+    seen_events = set()  # Prevent duplicate messages
+    
+    while running:
+        try:
+            log = log_queue.get(timeout=0.5)
+            
+            # Create unique key for event
+            event_key = f"{log['app']}-{log['type']}"
+            
+            # Skip if we just showed this event (within 2 seconds)
+            current_time = time.time()
+            if event_key in seen_events:
+                continue
+            
+            seen_events.add(event_key)
+            # Clear old events after 2 seconds
+            Thread(target=lambda: (time.sleep(2), seen_events.discard(event_key)), daemon=True).start()
+            
+            if log['type'] == 'started' or log['type'] == 'access':
+                print(f"{Colors.GREEN}[{log['timestamp']}] ▶ {Colors.BOLD}{log['app']}{Colors.RESET} "
+                      f"{Colors.GREEN}started using microphone (PID: {log['pid']}){Colors.RESET}")
+            elif log['type'] == 'stopped':
+                print(f"{Colors.RED}[{log['timestamp']}] ■ {Colors.BOLD}{log['app']}{Colors.RESET} "
+                      f"{Colors.RED}stopped using microphone (PID: {log['pid']}){Colors.RESET}")
+                      
+        except queue.Empty:
+            continue
 
 def signal_handler(signum, frame):
     """Handle Ctrl+C gracefully"""
@@ -223,8 +225,16 @@ def main():
     # Setup signal handler
     signal.signal(signal.SIGINT, signal_handler)
     
+    # Start monitoring threads
+    log_thread = Thread(target=monitor_system_logs, daemon=True)
+    device_thread = Thread(target=monitor_audio_devices, daemon=True)
+    
+    log_thread.start()
+    device_thread.start()
+    
+    # Display logs in main thread
     try:
-        monitor_microphone_access()
+        display_logs()
     except KeyboardInterrupt:
         signal_handler(None, None)
 
